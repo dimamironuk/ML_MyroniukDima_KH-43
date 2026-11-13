@@ -1,86 +1,63 @@
-import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+import pandas as pd
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 
 
-def get_dataset_stats(train_df, test_df):
-    num_train = len(train_df)
-    num_test = len(test_df)
-    num_vars = train_df.shape[1] - 1
-    total_missing = train_df.isnull().sum().sum()
-    total_cells = train_df.shape[0] * train_df.shape[1]
-    missing_pct = (total_missing / total_cells) * 100
-    duplicates = train_df.duplicated().sum()
-    num_features = len(train_df.select_dtypes(include=[np.number]).columns) - 1
-    cat_features = len(train_df.select_dtypes(include=['object', 'category']).columns)
-
-    return {
-        'num_train': num_train,
-        'num_test': num_test,
-        'num_vars': num_vars,
-        'total_missing': total_missing,
-        'missing_pct': missing_pct,
-        'duplicates': duplicates,
-        'num_features': num_features,
-        'cat_features': cat_features
-    }
+def print_stats_summary(train_df, test_df, ignore_cols=('SK_ID_CURR', 'TARGET')):
+    features = train_df.drop(columns=list(ignore_cols), errors='ignore')
+    missing = train_df.isnull().sum().sum()
+    print(f"Train: {len(train_df):,} | Test: {len(test_df):,}")
+    print(f"Features: {features.shape[1]} (Num: {features.select_dtypes(np.number).shape[1]}, Cat: {features.select_dtypes(exclude=np.number).shape[1]})")
+    print(f"Missing: {missing:,} ({missing / train_df.size * 100:.1f}%) | Duplicates: {train_df.duplicated().sum()}")
 
 
-def print_stats_summary(stats):
-    print(f"Observations (train): {stats['num_train']:,}")
-    print(f"Observations (test):  {stats['num_test']:,}")
-    print(f"Variables:            {stats['num_vars']}")
-    print(f"Missing values:       {stats['total_missing']:,} ({stats['missing_pct']:.1f}% of all cells)")
-    print(f"Duplicates:           {stats['duplicates']}")
-    print(f"Numeric features:     {stats['num_features']}")
-    print(f"Categorical features: {stats['cat_features']}")
-
-
-def prepare_pipeline(train_df, test_df):
+def prepare_data(train_df, test_df, missing_thresh=0.5):
     test_ids = test_df['SK_ID_CURR']
     y = train_df['TARGET']
-    X = train_df.drop(columns=['TARGET', 'SK_ID_CURR'])
-    X_test = test_df.drop(columns=['SK_ID_CURR'])
+    X = train_df.drop(columns=['TARGET', 'SK_ID_CURR'], errors='ignore')
+    X_test = test_df.drop(columns=['SK_ID_CURR'], errors='ignore')
 
-    cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+    keep_cols = X.columns[X.isnull().mean() <= missing_thresh]
+    X, X_test = X[keep_cols].copy(), X_test[keep_cols].copy()
 
-    for col in cat_cols:
-        if X[col].nunique() <= 2:
-            vals = sorted(pd.concat([X[col], X_test[col]]).dropna().unique())
-            mapping = {v: i for i, v in enumerate(vals)}
-            X[col] = X[col].map(mapping)
-            X_test[col] = X_test[col].map(mapping)
-        else:
-            X = pd.get_dummies(X, columns=[col], drop_first=True)
-            X_test = pd.get_dummies(X_test, columns=[col], drop_first=True)
+    num_cols = X.select_dtypes(include=np.number).columns.tolist()
+    cat_cols = X.select_dtypes(exclude=np.number).columns.tolist()
 
+    if num_cols:
+        num_imputer = SimpleImputer(strategy='median')
+        X[num_cols] = num_imputer.fit_transform(X[num_cols])
+        X_test[num_cols] = num_imputer.transform(X_test[num_cols])
+
+    if cat_cols:
+        cat_imputer = SimpleImputer(strategy='most_frequent')
+        X[cat_cols] = cat_imputer.fit_transform(X[cat_cols])
+        X_test[cat_cols] = cat_imputer.transform(X_test[cat_cols])
+
+    X = pd.get_dummies(X, drop_first=True, dtype=int)
+    X_test = pd.get_dummies(X_test, drop_first=True, dtype=int)
     X, X_test = X.align(X_test, join='left', axis=1, fill_value=0)
-    feature_names = X.columns.tolist()
 
-    imputer = SimpleImputer(strategy='median')
-    X_imputed = imputer.fit_transform(X)
-    X_test_imputed = imputer.transform(X_test)
+    return X, y, X_test, test_ids, X.columns.tolist()
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_imputed, y, test_size=0.2, random_state=42, stratify=y
-    )
 
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
-    X_test_scaled = scaler.transform(X_test_imputed)
+def get_folds(X, y, X_test, n_splits=5, random_state=42):
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    X_te = X_test.to_numpy()
 
-    return {
-        'X_train': X_train,
-        'X_val': X_val,
-        'X_train_scaled': X_train_scaled,
-        'X_val_scaled': X_val_scaled,
-        'y_train': y_train,
-        'y_val': y_val,
-        'X_test_imputed': X_test_imputed,
-        'X_test_scaled': X_test_scaled,
-        'test_ids': test_ids,
-        'feature_names': feature_names
-    }
+    for train_idx, val_idx in skf.split(X, y):
+        X_tr = X.iloc[train_idx].to_numpy()
+        X_va = X.iloc[val_idx].to_numpy()
+
+        scaler = StandardScaler()
+        yield {
+            'X_train': X_tr,
+            'X_val': X_va,
+            'X_test_imputed': X_te,
+            'X_train_scaled': scaler.fit_transform(X_tr),
+            'X_val_scaled': scaler.transform(X_va),
+            'X_test_scaled': scaler.transform(X_te),
+            'y_train': y.iloc[train_idx],
+            'y_val': y.iloc[val_idx],
+        }
